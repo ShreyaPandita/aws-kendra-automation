@@ -1,0 +1,290 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simple Kendra Experience Custom Resource Example'
+
+Parameters:
+  IndexName:
+    Type: String
+    Default: 'MyKendraIndex'
+    Description: Name of the Kendra Index
+    
+  ExperienceName:
+    Type: String
+    Default: 'MySearchExperience'
+    Description: Name of the Kendra Experience
+
+Resources:
+  KendraIndexRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: kendra.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonKendraFullAccess
+
+  KendraIndex:
+    Type: AWS::Kendra::Index
+    Properties:
+      Name: !Ref IndexName
+      Edition: 'DEVELOPER_EDITION'
+      RoleArn: !GetAtt KendraIndexRole.Arn
+
+  CustomResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonKendraFullAccess
+        - arn:aws:iam::aws:policy/AWSSSOMasterAccountAdministrator
+
+  KendraExperienceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt CustomResourceRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import logging
+          import time
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          kendra = boto3.client('kendra')
+          sso = boto3.client('identitystore')
+
+          def handler(event, context):
+              logger.info(f"Received event: {event}")
+              
+              try:
+                  request_type = event['RequestType']
+                  properties = event['ResourceProperties']
+                  
+                  physical_id = f"KendraExperience-{properties['IndexId']}"
+                  
+                  if request_type == 'Create':
+                      wait_for_index(properties['IndexId'])
+                      response = create_experience(properties)
+                      experience_id = response['Id']
+                      
+                      # Wait for experience to be active
+                      wait_for_experience(experience_id, properties['IndexId'])
+                      
+                      # Associate the hardcoded user with the experience
+                      associate_user(
+                          index_id=properties['IndexId'],
+                          experience_id=experience_id
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                     {'ExperienceId': experience_id}, physical_id)
+                  
+                  elif request_type == 'Delete':
+                      delete_experience(properties)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                     {}, physical_id)
+                  
+                  else:  # Update
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                     {}, physical_id)
+                  
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                 {'Error': str(e)})
+
+          def get_identity_store_id():
+              sso_admin = boto3.client('sso-admin')
+              instances = sso_admin.list_instances()
+              logger.info(f"Found Identity Store instances: {instances}")
+              return instances['Instances'][0]['IdentityStoreId']
+
+          def get_user_id(username):
+              try:
+                  identity_store_id = get_identity_store_id()
+                  logger.info(f"Using Identity Store ID: {identity_store_id}")
+                  
+                  response = sso.list_users(
+                      IdentityStoreId=identity_store_id,
+                      Filters=[
+                          {
+                              'AttributePath': 'UserName',
+                              'AttributeValue': username
+                          }
+                      ]
+                  )
+                  logger.info(f"User lookup response: {response}")
+                  
+                  if not response['Users']:
+                      raise Exception(f"User with username {username} not found in Identity Center")
+                  
+                  user_id = response['Users'][0]['UserId']
+                  logger.info(f"Found user ID: {user_id}")
+                  return user_id
+              except Exception as e:
+                  logger.error(f"Error getting user ID: {str(e)}")
+                  raise
+
+          def associate_user(index_id, experience_id):
+              try:
+                  # Get the user ID from Identity Center using username
+                  user_id = get_user_id('pandasr')  # Using username instead of email
+                  logger.info(f"Found user ID: {user_id}")
+                  
+                  # First, associate the user entity
+                  logger.info(f"Associating user {user_id} with experience {experience_id}")
+                  kendra.associate_entities_to_experience(
+                      Id=experience_id,
+                      IndexId=index_id,
+                      EntityList=[
+                          {
+                              'EntityId': user_id,  # Use the Identity Center user ID
+                              'EntityType': 'USER'
+                          }
+                      ]
+                  )
+                  
+                  # Then, set the user as an OWNER
+                  logger.info(f"Setting user {user_id} as OWNER")
+                  kendra.associate_personas_to_entities(
+                      Id=experience_id,
+                      IndexId=index_id,
+                      Personas=[
+                          {
+                              'EntityId': user_id,  # Use the Identity Center user ID
+                              'Persona': 'OWNER'
+                          }
+                      ]
+                  )
+                  
+                  logger.info(f"Successfully associated user with experience {experience_id}")
+              except Exception as e:
+                  logger.error(f"Error associating user: {str(e)}")
+                  raise
+
+          def wait_for_experience(experience_id, index_id):
+              max_attempts = 60
+              attempts = 0
+              
+              while attempts < max_attempts:
+                  try:
+                      response = kendra.describe_experience(
+                          Id=experience_id,
+                          IndexId=index_id
+                      )
+                      status = response['Status']
+                      logger.info(f"Experience status: {status}")
+                      
+                      if status == 'ACTIVE':
+                          return
+                      elif status == 'FAILED':
+                          raise Exception(f"Experience creation failed: {response.get('ErrorMessage', 'Unknown error')}")
+                      
+                      time.sleep(5)
+                      attempts += 1
+                  except Exception as e:
+                      logger.error(f"Error checking experience status: {str(e)}")
+                      raise
+              
+              raise Exception("Timeout waiting for experience to become active")
+
+          def wait_for_index(index_id):
+              max_attempts = 60
+              attempts = 0
+              
+              while attempts < max_attempts:
+                  try:
+                      response = kendra.describe_index(
+                          Id=index_id
+                      )
+                      status = response['Status']
+                      logger.info(f"Index status: {status}")
+                      
+                      if status == 'ACTIVE':
+                          return
+                      elif status == 'FAILED':
+                          raise Exception(f"Index creation failed: {response.get('ErrorMessage', 'Unknown error')}")
+                      
+                      time.sleep(5)
+                      attempts += 1
+                  except Exception as e:
+                      logger.error(f"Error checking index status: {str(e)}")
+                      raise
+              
+              raise Exception("Timeout waiting for index to become active")
+
+          def create_experience(properties):
+              response = kendra.create_experience(
+                  Name=properties['ExperienceName'],
+                  Description='Created by CloudFormation',
+                  RoleArn=properties['RoleArn'],
+                  IndexId=properties['IndexId'],
+                  Configuration={
+                      'UserIdentityConfiguration': {
+                          'IdentityAttributeName': 'email'
+                      }
+                  }
+              )
+              return response
+
+          def delete_experience(properties):
+              try:
+                  experiences = kendra.list_experiences(
+                      IndexId=properties['IndexId']
+                  )['ExperienceSummaryItems']
+                  
+                  for exp in experiences:
+                      if exp['Name'] == properties['ExperienceName']:
+                          kendra.delete_experience(
+                              Id=exp['Id'],
+                              IndexId=properties['IndexId']
+                          )
+              except Exception as e:
+                  logger.error(f"Error during deletion: {str(e)}")
+
+      Timeout: 300
+      MemorySize: 128
+
+  KendraExperienceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: kendra.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonKendraFullAccess
+        - arn:aws:iam::aws:policy/AWSSSOMasterAccountAdministrator
+
+  KendraExperienceCustomResource:
+    Type: Custom::KendraExperience
+    Properties:
+      ServiceToken: !GetAtt KendraExperienceFunction.Arn
+      ExperienceName: !Ref ExperienceName
+      IndexId: !Ref KendraIndex
+      RoleArn: !GetAtt KendraExperienceRole.Arn
+
+Outputs:
+  IndexId:
+    Description: 'ID of the created Kendra Index'
+    Value: !Ref KendraIndex
+    
+  ExperienceId:
+    Description: 'ID of the created Kendra Experience'
+    Value: !GetAtt KendraExperienceCustomResource.ExperienceId
